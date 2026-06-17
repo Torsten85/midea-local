@@ -1,15 +1,30 @@
 {
   "name": "midea-local",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local control of Midea smart air conditioners",
+  "license": "MIT",
+  "author": "Torsten Blindert",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Torsten85/midea-local.git"
+  },
+  "homepage": "https://github.com/Torsten85/midea-local",
+  "bugs": "https://github.com/Torsten85/midea-local/issues",
+  "keywords": ["midea", "air-conditioner", "smart-home", "local-control", "iot"],
+  "engines": {
+    "node": ">=18",
+    "bun": ">=1.0"
+  },
   "type": "module",
-  "main": "./dist/src/index.js",
-  "types": "./dist/src/index.d.ts",
+  "main": "./dist/cjs/index.cjs",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/src/index.d.ts",
-      "import": "./dist/src/index.js",
-      "bun": "./src/index.ts"
+      "types": "./dist/types/index.d.ts",
+      "bun": "./src/index.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.cjs"
     }
   },
   "files": [
@@ -17,7 +32,7 @@
     "src"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build ./src/index.ts --outdir ./dist/src --target node --splitting && bunx tsc",
+    "build": "rm -rf dist && bun build ./src/index.ts --outdir ./dist/esm --target node --splitting && bun build ./src/index.ts --outdir ./dist/cjs --target node --format cjs --external 'node:*' && mv ./dist/cjs/index.js ./dist/cjs/index.cjs && bunx tsc",
     "test": "bun test",
     "prepublishOnly": "bun run build"
   },
