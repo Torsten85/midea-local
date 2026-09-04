@@ -124,7 +124,12 @@ export class Discover {
 
       socket.on("error", (err) => {
         console.error(`Discovery socket error: ${err.message}`);
-        socket.close();
+        // May already be closed — never throw from an event handler.
+        try {
+          socket.close();
+        } catch {
+          // Already closed.
+        }
         reject(new DiscoverError(`Socket error: ${err.message}`));
       });
 
@@ -142,8 +147,18 @@ export class Discover {
         try {
           const version = Discover._getDeviceVersion(data);
 
-          // Create a task to get device info
-          const task = Discover._getDevice(ip, version, data);
+          // Create a task to get device info. The error handler is
+          // attached immediately: a task rejection must never escape
+          // into Promise.all below, where — as a detached callback —
+          // it would become an unhandled rejection and crash the host
+          // process (e.g. Node-RED, see issue #3 in
+          // node-red-contrib-midea-local).
+          const task = Discover._getDevice(ip, version, data).catch((e) => {
+            console.error(
+              `Failed to process device at ${ip}: ${e instanceof Error ? e.message : e}`,
+            );
+            return null;
+          });
           tasks.push(task);
         } catch (e) {
           if (e instanceof DiscoverError) {
@@ -184,19 +199,38 @@ export class Discover {
         // Wait for responses
         console.debug(`Waiting ${timeout} seconds for responses...`);
         setTimeout(async () => {
-          socket.close();
+          // The socket may already be closed if an error occurred.
+          try {
+            socket.close();
+          } catch {
+            // Already closed.
+          }
 
           console.debug(`Discovered ${tasks.length} devices.`);
 
-          // Wait for remaining tasks
-          const results = await Promise.all(tasks);
+          // Wait for remaining tasks. Tasks have individual error
+          // handlers, so this cannot reject — but never let a rejection
+          // escape this detached callback: it would go unhandled and
+          // take down the host process.
+          try {
+            const results = await Promise.all(tasks);
 
-          // Remove any null entries
-          const devices = results.filter(
-            (d): d is Device => d !== null,
-          );
+            // Remove any null entries
+            const devices = results.filter(
+              (d): d is Device => d !== null,
+            );
 
-          resolve(devices);
+            resolve(devices);
+          } catch (e) {
+            console.error(
+              `Discovery failed: ${e instanceof Error ? e.message : e}`,
+            );
+            reject(
+              e instanceof DiscoverError
+                ? e
+                : new DiscoverError(`${e instanceof Error ? e.message : e}`),
+            );
+          }
         }, timeout * 1000);
       });
     });
@@ -527,7 +561,19 @@ export class Discover {
 
     // Don't query device if requested
     if (Discover._autoConnect) {
-      await Discover.connect(device);
+      try {
+        await Discover.connect(device);
+      } catch (e) {
+        // A failed auto-connect (e.g. CloudError during token fetch)
+        // must not reject: the rejection would escape through
+        // Promise.all in discover(), whose detached setTimeout
+        // callback turns it into an unhandled rejection that crashes
+        // the host process. Log and skip the device instead.
+        console.error(
+          `Failed to connect to device at ${ip}: ${e instanceof Error ? e.message : e}. Skipping device.`,
+        );
+        return null;
+      }
     }
 
     return device;

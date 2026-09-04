@@ -5,8 +5,10 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
+import * as dgram from "node:dgram";
 import { Device } from "../src/base-device.ts";
 import { DEVICE_TYPE, DISCOVERY_MSG } from "../src/const.ts";
+import { CloudError } from "../src/cloud.ts";
 import { AirConditioner } from "../src/device/ac/device.ts";
 import { Discover } from "../src/discover.ts";
 
@@ -121,5 +123,114 @@ describe("Discover", () => {
     expect(device).not.toBeNull();
     expect(device).toBeInstanceOf(AirConditioner);
     expect(device.version).toBe(3);
+  });
+});
+
+// ─── Auto-connect failure handling (unhandled rejection regression) ────────
+
+describe("Discover auto-connect failures", () => {
+  const [HOST_V2, RESPONSE_V2] = DISCOVER_RESPONSES[0]!;
+
+  it("should skip a device (return null, not reject) when auto-connect fails", async () => {
+    const originalConnect = (Discover as any).connect;
+    (Discover as any)._autoConnect = true;
+    (Discover as any).connect = async () => {
+      throw new CloudError("Failed to get token from cloud. system error");
+    };
+
+    try {
+      // Before the fix this rejected; the rejection escaped through
+      // Promise.all in discover()'s detached setTimeout callback and
+      // became an unhandled rejection that crashed the host process.
+      const device = await (Discover as any)._getDevice(
+        HOST_V2.ip,
+        2,
+        RESPONSE_V2,
+      );
+      expect(device).toBeNull();
+    } finally {
+      (Discover as any).connect = originalConnect;
+      (Discover as any)._autoConnect = false;
+    }
+  });
+
+  it("should resolve discover() without unhandled rejections when a device fails", async () => {
+    // Fake device: answers discovery packets on 127.0.0.1:6445.
+    const responder = dgram.createSocket("udp4");
+    const unhandledRejections: unknown[] = [];
+    const onUnhandled = (err: unknown) => {
+      unhandledRejections.push(err);
+    };
+    process.on("unhandledRejection", onUnhandled);
+
+    const originalConnect = (Discover as any).connect;
+    (Discover as any).connect = async () => {
+      throw new CloudError("Failed to get token from cloud. system error");
+    };
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        responder.on("error", reject);
+        responder.on("message", (_msg, rinfo) => {
+          responder.send(RESPONSE_V2, rinfo.port, rinfo.address);
+        });
+        responder.bind(6445, "127.0.0.1", () => resolve());
+      });
+
+      const devices = await Discover.discover({
+        target: "127.0.0.1",
+        timeout: 0.2,
+        discoveryPackets: 1,
+        autoConnect: true,
+      });
+
+      // The device was discovered but its auto-connect failed: it must
+      // be skipped (logged), and discovery must still resolve.
+      expect(devices).toEqual([]);
+
+      // Give any potential unhandled rejection time to fire.
+      await new Promise((r) => setTimeout(r, 150));
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      (Discover as any).connect = originalConnect;
+      (Discover as any)._autoConnect = false;
+      try {
+        responder.close();
+      } catch {
+        // Already closed.
+      }
+    }
+  });
+
+  it("should return discovered devices when auto-connect succeeds", async () => {
+    const responder = dgram.createSocket("udp4");
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        responder.on("error", reject);
+        responder.on("message", (_msg, rinfo) => {
+          responder.send(RESPONSE_V2, rinfo.port, rinfo.address);
+        });
+        responder.bind(6445, "127.0.0.1", () => resolve());
+      });
+
+      const devices = await Discover.discover({
+        target: "127.0.0.1",
+        timeout: 0.2,
+        discoveryPackets: 1,
+        autoConnect: false,
+      });
+
+      expect(devices).toHaveLength(1);
+      expect(devices[0]).toBeInstanceOf(AirConditioner);
+      expect(devices[0]!.version).toBe(2);
+    } finally {
+      try {
+        responder.close();
+      } catch {
+        // Already closed.
+      }
+    }
   });
 });
