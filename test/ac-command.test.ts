@@ -767,8 +767,9 @@ describe('TestPropertiesResponse', () => {
 
     expect(resp).toBeInstanceOf(PropertiesResponse);
     expect(resp.getProperty(PROPERTY_ID.SWING_LR_ANGLE)).toBe(50);
-    // SWING_UD_ANGLE failed so it should either be 0 or not present
-    expect(resp.getProperty(PROPERTY_ID.SWING_UD_ANGLE)).toBe(0);
+    // A rejected property has no successful value to expose.
+    expect(resp.getProperty(PROPERTY_ID.SWING_UD_ANGLE)).toBeNull();
+    expect(resp.failedProperties.get(PROPERTY_ID.SWING_UD_ANGLE)).toBe(0x11);
   });
 
   it('should ignore property notifications', () => {

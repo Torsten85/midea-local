@@ -6,6 +6,7 @@
  */
 
 import { Device } from "../../base-device.ts";
+import { ProtocolError } from "../../lan.ts";
 import type { Token, Key } from "../../base-device.ts";
 import { DEVICE_TYPE } from "../../const.ts";
 import { InvalidFrameError } from "../../frame.ts";
@@ -156,6 +157,33 @@ export const ENERGY_DATA_FORMAT = {
 
 export type EnergyDataFormat =
   (typeof ENERGY_DATA_FORMAT)[keyof typeof ENERGY_DATA_FORMAT];
+
+/** Device-reported, already decoded capability fields; no defaults or overrides. */
+export type ReportedCapabilities = Readonly<Record<string, boolean | number>>;
+
+export interface ReportedTemperatureRange {
+  readonly min: number | null;
+  readonly max: number | null;
+}
+
+export type TemperatureLimitsByMode = Readonly<Record<"cool" | "heat" | "auto", ReportedTemperatureRange>>;
+
+export type ReportedFeatures = Readonly<Record<
+  "turbo_heat" | "turbo_cool" | "buzzer" | "filter_clean" | "smart_eye" | "wind_on_me" | "wind_off_me",
+  boolean | null
+>>;
+
+/** Capability values actually used by the library, including defaults and overrides. */
+export interface EffectiveCapabilities {
+  readonly min_target_temperature: number;
+  readonly max_target_temperature: number;
+  readonly supported_modes: readonly OperationalMode[];
+  readonly supported_swing_modes: readonly SwingMode[];
+  readonly supported_fan_speeds: readonly number[];
+  readonly supported_aux_modes: readonly AuxHeatMode[];
+  readonly supported_rate_selects: readonly RateSelect[];
+  readonly additional_capabilities: number;
+}
 
 // ---------------------------------------------------------------------------
 // AC_CAPABILITY — Bitmask flags
@@ -314,6 +342,7 @@ export class AirConditioner extends Device {
   };
 
   // ---- Capabilities ----
+  private _reportedCapabilities: Map<string, boolean | number> | null = null;
   private _minTargetTemperature = 16;
   private _maxTargetTemperature = 30;
 
@@ -510,6 +539,14 @@ export class AirConditioner extends Device {
    * @internal
    */
   private _updateCapabilities(res: CapabilitiesResponse): void {
+    // Snapshot the merged report before applying defaults or user overrides.
+    this._reportedCapabilities = new Map();
+    for (const [name, value] of res.rawCapabilities) {
+      if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) {
+        this._reportedCapabilities.set(name, value);
+      }
+    }
+
     // Build list of supported operation modes
     const opModes: OperationalMode[] = [OPERATIONAL_MODE.FAN_ONLY];
     if (res.dryMode) opModes.push(OPERATIONAL_MODE.DRY);
@@ -580,6 +617,7 @@ export class AirConditioner extends Device {
     // Allow capabilities to enable energy usage requests, but not disable them.
     // We've seen devices that claim no capability but return energy data.
     this._requestEnergyUsage = this._requestEnergyUsage || res.energyStats;
+    this._capabilities.set(AC_CAPABILITY.ENERGY_STATS, res.energyStats);
 
     this._capabilities.set(AC_CAPABILITY.HUMIDITY as number, res.humidity);
     this._capabilities.set(
@@ -694,12 +732,13 @@ export class AirConditioner extends Device {
    */
   private async _sendCommandsGetResponses(
     commands: Command | Command[],
+    requireResponse = false,
   ): Promise<Response[]> {
     const cmdList = Array.isArray(commands) ? commands : [commands];
 
     const rawResponses: Uint8Array[] = [];
     for (const cmd of cmdList) {
-      const responses = await super._sendCommand(cmd);
+      const responses = await super._sendCommand(cmd, { requireResponse });
       rawResponses.push(...responses);
     }
 
@@ -727,6 +766,10 @@ export class AirConditioner extends Device {
     this._supported =
       this._supported || (this._online && validResponses.length > 0);
 
+    if (requireResponse && validResponses.length === 0) {
+      this._online = false;
+      throw new ProtocolError(`No valid response from device ${this.id}.`);
+    }
     return validResponses;
   }
 
@@ -794,10 +837,10 @@ export class AirConditioner extends Device {
       );
     }
 
-    // Send the command and ignore all responses
+    // Require a valid reply; refresh below reads the resulting display state.
     const cmd = new ToggleDisplayCommand();
     cmd.beepOn = this._beepOn;
-    await this._sendCommandsGetResponses(cmd);
+    await this._sendCommandsGetResponses(cmd, true);
 
     // Force a refresh to get the updated display state
     await this.refresh();
@@ -867,12 +910,25 @@ export class AirConditioner extends Device {
 
     // Build command with properties
     const cmd = new SetPropertiesCommand(properties);
-    for (const response of await this._sendCommandsGetResponses(cmd)) {
+    const responses = await this._sendCommandsGetResponses(cmd, true);
+    const failures = new Map<PropertyId, number>();
+    for (const response of responses) {
       this._updateState(response);
+      if (response instanceof PropertiesResponse) {
+        for (const [property, result] of response.failedProperties) {
+          if (properties.has(property)) failures.set(property, result);
+        }
+      }
+    }
+    if (failures.size > 0) {
+      const details = [...failures].map(([property, result]) =>
+        `rejected property 0x${property.toString(16).padStart(4, "0")} (result 0x${result.toString(16).padStart(2, "0")})`,
+      );
+      throw new Error(`Device ${this.id} ${details.join(", ")}`);
     }
   }
 
-  /** Apply the local state to the device. */
+  /** Apply local state. Rejects on transport failure, no valid reply, or property refusal. */
   override async apply(): Promise<void> {
     // Warn if trying to apply unsupported modes
     if (!this.supportedOperationModes.includes(this._operationalMode)) {
@@ -951,7 +1007,7 @@ export class AirConditioner extends Device {
     cmd.independentAuxHeat = this._auxMode === AUX_HEAT_MODE.AUX_ONLY;
 
     // Process any state responses from the device
-    for (const response of await this._sendCommandsGetResponses(cmd)) {
+    for (const response of await this._sendCommandsGetResponses(cmd, true)) {
       this._updateState(response);
     }
 
@@ -988,6 +1044,64 @@ export class AirConditioner extends Device {
 
     // Update supported properties
     this._updateSupportedProperties();
+  }
+
+  /** Last successfully decoded capability report. Null until discovery succeeds. */
+  get reportedCapabilities(): ReportedCapabilities | null {
+    return this._reportedCapabilities === null ? null : Object.fromEntries(this._reportedCapabilities);
+  }
+
+  /** Current effective values; returned collections are defensive snapshots. */
+  get effectiveCapabilities(): EffectiveCapabilities {
+    return {
+      min_target_temperature: this.minTargetTemperature,
+      max_target_temperature: this.maxTargetTemperature,
+      supported_modes: [...this.supportedOperationModes],
+      supported_swing_modes: [...this.supportedSwingModes],
+      supported_fan_speeds: [...this.supportedFanSpeeds],
+      supported_aux_modes: [...this.supportedAuxModes],
+      supported_rate_selects: [...this.supportedRateSelects],
+      additional_capabilities: this._capabilities.flags,
+    };
+  }
+
+  private _reportedBoolean(name: string): boolean | null {
+    const value = this._reportedCapabilities?.get(name);
+    return typeof value === "boolean" ? value : null;
+  }
+
+  private _reportedNumber(name: string): number | null {
+    const value = this._reportedCapabilities?.get(name);
+    return typeof value === "number" ? value : null;
+  }
+
+  /** Reported encoding, not an automatic selection or a guarantee of correct scaling. */
+  get reportedEnergyDataFormat(): EnergyDataFormat | null {
+    if (this._reportedBoolean("energy_stats") !== true) return null;
+    const bcd = this._reportedBoolean("energy_bcd");
+    return bcd === null ? null : bcd ? ENERGY_DATA_FORMAT.BCD : ENERGY_DATA_FORMAT.BINARY;
+  }
+
+  /** Per-mode Celsius limits from the report, without inferred fallback bounds. */
+  get temperatureLimitsByMode(): TemperatureLimitsByMode {
+    const range = (mode: string): ReportedTemperatureRange => ({
+      min: this._reportedNumber(`${mode}_min_temperature`),
+      max: this._reportedNumber(`${mode}_max_temperature`),
+    });
+    return { cool: range("cool"), heat: range("heat"), auto: range("auto") };
+  }
+
+  /** Fine-grained report flags. Null means not reported, rather than unsupported. */
+  get reportedFeatures(): ReportedFeatures {
+    return {
+      turbo_heat: this._reportedBoolean("turbo_heat"),
+      turbo_cool: this._reportedBoolean("turbo_cool"),
+      buzzer: this._reportedBoolean("buzzer"),
+      filter_clean: this._reportedBoolean("filter_clean"),
+      smart_eye: this._reportedBoolean("smart_eye"),
+      wind_on_me: this._reportedBoolean("wind_on_me"),
+      wind_off_me: this._reportedBoolean("wind_off_me"),
+    };
   }
 
   // =========================================================================
@@ -1581,14 +1695,12 @@ export class AirConditioner extends Device {
   /** Return all device capabilities as a plain object. */
   override capabilitiesDict(): Record<string, unknown> {
     return {
-      min_target_temperature: this.minTargetTemperature,
-      max_target_temperature: this.maxTargetTemperature,
-      supported_modes: this.supportedOperationModes,
-      supported_swing_modes: this.supportedSwingModes,
-      supported_fan_speeds: this.supportedFanSpeeds,
-      supported_aux_modes: this.supportedAuxModes,
-      supported_rate_selects: this.supportedRateSelects,
-      additional_capabilities: this._capabilities.flags,
+      ...this.effectiveCapabilities,
+      reported_capabilities: this.reportedCapabilities,
+      effective_capabilities: this.effectiveCapabilities,
+      reported_energy_data_format: this.reportedEnergyDataFormat,
+      temperature_limits_by_mode: this.temperatureLimitsByMode,
+      reported_features: this.reportedFeatures,
     };
   }
 }

@@ -71,7 +71,10 @@ export class Device {
    * Send a command to the device and return any responses.
    * @internal
    */
-  protected async _sendCommand(command: Frame): Promise<Uint8Array[]> {
+  protected async _sendCommand(
+    command: Frame,
+    options: { requireResponse?: boolean } = {},
+  ): Promise<Uint8Array[]> {
     const data = command.toBytes();
 
     const start = performance.now();
@@ -79,6 +82,8 @@ export class Device {
     try {
       responses = await this._lan.send(Buffer.from(data));
     } catch (e) {
+      this._online = false;
+      if (options.requireResponse) throw e;
       if (e instanceof ProtocolError) {
         console.error(`Network error ${this._ip}:${this._port}: ${e.message}`);
         return [];
@@ -98,6 +103,10 @@ export class Device {
       }
     }
 
+    if (options.requireResponse && responses.length === 0) {
+      this._online = false;
+      throw new ProtocolError(`No response from device ${this.id}.`);
+    }
     return responses;
   }
 

@@ -103,7 +103,7 @@ export class Frame {
   /**
    * Validate a received frame.
    *
-   * Checks minimum length, checksum integrity, and device-type match.
+   * Checks minimum and declared length, start byte, checksum, and device type.
    * Throws {@link InvalidFrameError} on any mismatch.
    *
    * @param frame              - The raw frame bytes (may be a sub-view).
@@ -114,10 +114,14 @@ export class Frame {
     expectedDeviceType: DeviceType,
   ): void {
     // Ensure length is sane
-    if (frame.length < Frame.HEADER_LENGTH) {
+    if (frame.length < Frame.HEADER_LENGTH + 1) {
       throw new InvalidFrameError(
         `Frame is too short: ${Buffer.from(frame).toString("hex")}`,
       );
+    }
+
+    if (frame[0] !== 0xaa || frame[1] !== frame.length - 1) {
+      throw new InvalidFrameError("Invalid frame header or declared length.");
     }
 
     // Validate frame checksum

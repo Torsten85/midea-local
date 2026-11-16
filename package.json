@@ -1,6 +1,6 @@
 {
   "name": "midea-local",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Local control of Midea smart air conditioners",
   "license": "MIT",
   "author": "Torsten Blindert",
@@ -34,6 +34,7 @@
   "scripts": {
     "build": "rm -rf dist && bun build ./src/index.ts --outdir ./dist/esm --target node --splitting && bun build ./src/index.ts --outdir ./dist/cjs --target node --format cjs --external 'node:*' && mv ./dist/cjs/index.js ./dist/cjs/index.cjs && bunx tsc",
     "test": "bun test",
+    "test:build": "bun run build && node scripts/verify-build.mjs",
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
