@@ -22,6 +22,13 @@ export class InvalidResponseError extends Error {
   }
 }
 
+/** Reject missing bytes before JS coercion can turn them into plausible state. */
+function requirePayloadLength(payload: Uint8Array, minimum: number, kind: string): void {
+  if (payload.length < minimum) {
+    throw new InvalidResponseError(`${kind} payload is truncated: expected at least ${minimum} bytes, received ${payload.length}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Const objects & derived union types
 // ---------------------------------------------------------------------------
@@ -142,6 +149,8 @@ export function decodeProperty(id: PropertyId, data: Uint8Array): unknown {
   if (!isPropertySupported(id)) {
     throw new Error(`Property 0x${id.toString(16).padStart(4, "0")} decode is not supported.`);
   }
+
+  requirePayloadLength(data, id === PROPERTY_ID.CASCADE || id === PROPERTY_ID.IECO ? 2 : 1, "Property");
 
   if (
     id === PROPERTY_ID.BREEZELESS ||
@@ -609,6 +618,8 @@ export class Response {
     // Validate the frame
     Frame.validate(frame, DEVICE_TYPE.AIR_CONDITIONER);
 
+    requirePayloadLength(frame, 13, "Response frame");
+
     // Determine response class from ID
     let ResponseClass: new (payload: Uint8Array) => Response = Response;
 
@@ -630,6 +641,7 @@ export class Response {
       ResponseClass = PropertiesResponse;
     } else if (responseId === RESPONSE_ID.GROUP_DATA) {
       // Response type depends on an additional "group" byte
+      requirePayloadLength(frame.subarray(10, frame.length - 2), 4, "Group data");
       const group = frame[13]! & 0x0f;
       if (group === 4) {
         ResponseClass = EnergyUsageResponse;
@@ -800,16 +812,18 @@ export class CapabilitiesResponse extends Response {
 
   private _parseCapabilities(payload: Uint8Array): void {
     this._capabilities.clear();
+    requirePayloadLength(payload, 2, "Capabilities");
 
     const count = payload[1]!;
     let caps = payload.subarray(2);
 
     for (let i = 0; i < count; i++) {
-      // Stop if out of data
-      if (caps.length < 3) break;
+      // Reject incomplete TLVs rather than inventing field values.
+      requirePayloadLength(caps, 3, "Capability header");
 
       // Skip empty capabilities
       const size = caps[2]!;
+      requirePayloadLength(caps, 3 + size, "Capability value");
       if (size === 0) {
         caps = caps.subarray(3);
         continue;
@@ -1135,6 +1149,7 @@ export class StateResponse extends Response {
   }
 
   private _parse(payload: Uint8Array): void {
+    requirePayloadLength(payload, 17, "State");
     this.powerOn = Boolean(payload[1]! & 0x01);
 
     // Unpack target temp and mode byte
@@ -1202,6 +1217,12 @@ export class StateResponse extends Response {
 /** Response to properties query. */
 export class PropertiesResponse extends Response {
   private _properties: Map<PropertyId, unknown> = new Map();
+  private _failedProperties = new Map<PropertyId, number>();
+
+  /** Explicit device rejection codes, separate from successfully decoded values. */
+  get failedProperties(): ReadonlyMap<PropertyId, number> {
+    return this._failedProperties;
+  }
 
   constructor(payload: Uint8Array) {
     super(payload);
@@ -1210,20 +1231,18 @@ export class PropertiesResponse extends Response {
 
   private _parse(payload: Uint8Array): void {
     this._properties.clear();
+    this._failedProperties.clear();
+    requirePayloadLength(payload, 2, "Properties");
 
     const count = payload[1]!;
     let props = payload.subarray(2);
 
     for (let i = 0; i < count; i++) {
-      // Stop if out of data
-      if (props.length < 4) break;
+      // Reject incomplete TLVs rather than inventing field values.
+      requirePayloadLength(props, 4, "Property header");
 
-      // Skip empty properties
       const size = props[3]!;
-      if (size === 0) {
-        props = props.subarray(4);
-        continue;
-      }
+      requirePayloadLength(props, 4 + size, "Property value");
 
       // Unpack 16-bit ID (little-endian)
       const dv = new DataView(props.buffer, props.byteOffset, props.byteLength);
@@ -1242,17 +1261,24 @@ export class PropertiesResponse extends Response {
       // Check execution result and log any errors
       const error = props[2]! & 0x10;
       if (error) {
-        // Property failed — skip silently in TS port (Python logs error)
+        this._failedProperties.set(propertyId, props[2]!);
+        props = props.subarray(4 + size);
+        continue;
+      }
+      if (size === 0) {
+        props = props.subarray(4);
+        continue;
       }
 
       // Parse the property
       try {
-        const value = decodeProperty(propertyId, props.subarray(4));
+        const value = decodeProperty(propertyId, props.subarray(4, 4 + size));
         if (value !== null) {
           this._properties.set(propertyId, value);
         }
-      } catch {
-        // Unsupported property — skip
+      } catch (error) {
+        if (error instanceof InvalidResponseError) throw error;
+        // Unsupported property — skip.
       }
 
       // Advance to next property
@@ -1290,6 +1316,7 @@ export class EnergyUsageResponse extends Response {
   }
 
   private _parse(payload: Uint8Array): void {
+    requirePayloadLength(payload, 19, "Energy usage");
     function decodeBcd(d: number): number {
       return 10 * (d >> 4) + (d & 0x0f);
     }
@@ -1301,7 +1328,7 @@ export class EnergyUsageResponse extends Response {
         1 * decodeBcd(d[2]!) +
         0.01 * decodeBcd(d[3]!);
       const binary =
-        ((d[0]! << 24) + (d[1]! << 16) + (d[2]! << 8) + d[3]!) / 10;
+        (d[0]! * 0x1000000 + d[1]! * 0x10000 + d[2]! * 0x100 + d[3]!) / 10;
       return [bcd, binary];
     }
 
@@ -1358,6 +1385,7 @@ export class Group5Response extends Response {
   }
 
   private _parse(payload: Uint8Array): void {
+    requirePayloadLength(payload, 11, "Group 5");
     this.humidity = payload[4] !== 0 ? payload[4]! : null;
     this.outdoorFanSpeed = 8 * payload[8]!;
     this.defrost = Boolean(payload[10]);

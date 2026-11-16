@@ -6,6 +6,7 @@
  */
 
 import { Device } from "../../base-device.ts";
+import { ProtocolError } from "../../lan.ts";
 import { DEVICE_TYPE } from "../../const.ts";
 import type { DeviceType } from "../../const.ts";
 import { InvalidFrameError } from "../../frame.ts";
@@ -397,12 +398,13 @@ export class CommercialAirConditioner extends Device {
 
   private async _sendCommandsGetResponses(
     commands: Command | Command[],
+    requireResponse = false,
   ): Promise<Response[]> {
     const cmds = Array.isArray(commands) ? commands : [commands];
     const rawResponses: Uint8Array[] = [];
 
     for (const cmd of cmds) {
-      const responses = await this._sendCommand(cmd);
+      const responses = await this._sendCommand(cmd, { requireResponse });
       rawResponses.push(...responses);
     }
 
@@ -429,6 +431,10 @@ export class CommercialAirConditioner extends Device {
     // Device is supported if we can process any response
     this._supported ||= this._online && validResponses.length > 0;
 
+    if (requireResponse && validResponses.length === 0) {
+      this._online = false;
+      throw new ProtocolError(`No valid response from device ${this.id}.`);
+    }
     return validResponses;
   }
 
@@ -587,7 +593,7 @@ export class CommercialAirConditioner extends Device {
     }
 
     // Process any state responses from the device
-    for (const response of await this._sendCommandsGetResponses(cmds)) {
+    for (const response of await this._sendCommandsGetResponses(cmds, true)) {
       this._updateState(response);
     }
 

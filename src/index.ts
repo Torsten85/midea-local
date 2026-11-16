@@ -55,6 +55,11 @@ export {
   AC_CAPABILITY,
 } from "./device/ac/device.ts";
 
+export type {
+  ReportedCapabilities, ReportedTemperatureRange, TemperatureLimitsByMode,
+  ReportedFeatures, EffectiveCapabilities, EnergyDataFormat,
+} from "./device/ac/device.ts";
+
 // CC enums and types
 export {
   CC_FAN_SPEED,

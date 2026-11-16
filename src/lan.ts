@@ -192,6 +192,10 @@ export class Packet {
 
     const length = data.readUInt16LE(4);
 
+    if (length < 56 || (length - 56) % 16 !== 0) {
+      throw new ProtocolError(`Invalid packet length: ${length}`);
+    }
+
     if (data.length < length) {
       throw new ProtocolError(
         `Packet is truncated. Expected ${length} bytes, only have ${data.length} bytes: ${data.toString("hex")}`,
@@ -246,6 +250,7 @@ export class LanProtocol {
   protected _socket: net.Socket | null = null;
   protected _peer: string | null = null;
   protected _queue = new AsyncQueue<Buffer | Error>();
+  private _receiveBuffer: Buffer = Buffer.alloc(0);
 
   /** Peer address string (e.g. `"192.168.1.100:6444"`). */
   get peer(): string | null {
@@ -269,11 +274,13 @@ export class LanProtocol {
    */
   async connect(host: string, port: number, timeout: number = 5): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      this._receiveBuffer = Buffer.alloc(0);
+      this._queue.flush();
       const socket = new net.Socket();
 
       const timer = setTimeout(() => {
         socket.destroy();
-        reject(new Error("Connect timeout."));
+        reject(new ProtocolError("Connect timeout."));
       }, timeout * 1000);
 
       socket.connect(port, host, () => {
@@ -315,7 +322,29 @@ export class LanProtocol {
    * Override in subclasses for protocol-specific framing.
    */
   protected _onData(data: Buffer): void {
-    this._queue.put(data);
+    this._receiveBuffer = Buffer.concat([this._receiveBuffer, data]);
+    while (this._receiveBuffer.length >= 2) {
+      const start = this._receiveBuffer.indexOf(Buffer.from([0x5a, 0x5a]));
+      if (start === -1) {
+        // Retain a possible first header byte split across TCP chunks.
+        this._receiveBuffer = this._receiveBuffer.subarray(
+          this._receiveBuffer[this._receiveBuffer.length - 1] === 0x5a
+            ? this._receiveBuffer.length - 1 : this._receiveBuffer.length,
+        );
+        return;
+      }
+      this._receiveBuffer = this._receiveBuffer.subarray(start);
+      if (this._receiveBuffer.length < 6) return;
+      const length = this._receiveBuffer.readUInt16LE(4);
+      if (length < 56 || (length - 56) % 16 !== 0) {
+        this._queue.put(new ProtocolError(`Invalid packet length: ${length}`));
+        this._receiveBuffer = this._receiveBuffer.subarray(2);
+        continue;
+      }
+      if (this._receiveBuffer.length < length) return;
+      this._queue.put(this._receiveBuffer.subarray(0, length));
+      this._receiveBuffer = this._receiveBuffer.subarray(length);
+    }
   }
 
   /** Disconnect from the peer. */
@@ -869,7 +898,7 @@ export class Lan {
           remaining--;
         } else {
           this._disconnect();
-          throw new Error("No response from host.");
+          throw new ProtocolError("No response from host.");
         }
       }
     }
@@ -970,7 +999,7 @@ export class Lan {
           remaining--;
         } else {
           this._disconnect();
-          throw new Error("No response from host.");
+          throw new ProtocolError("No response from host.");
         }
       }
     }
